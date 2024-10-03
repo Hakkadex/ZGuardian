@@ -1,0 +1,230 @@
+#!/bin/bash
+
+# Define variables
+INSTALL_DIR="/opt/ZGuardian"
+SCRIPT_NAME="guardian.py"
+START_SYMLINK="/usr/local/bin/start-zguardian"
+STOP_SYMLINK="/usr/local/bin/stop-zguardian"
+
+# Create the installation directory
+echo "Creating installation directory at $INSTALL_DIR..."
+sudo mkdir -p $INSTALL_DIR
+
+# Create the Python script with the Guardian code
+echo "Creating the ZGuardian Python script..."
+cat << 'EOF' | sudo tee $INSTALL_DIR/$SCRIPT_NAME > /dev/null
+import pyshark
+import re
+import os
+import curses
+import signal
+import socket
+import requests
+from datetime import datetime
+
+# Global variable to stop capturing
+capture_running = True
+
+# Directory and file setup for saving flagged traffic
+desktop_dir = os.path.join(os.path.expanduser('~'), 'Desktop')
+flagged_traffic_file = os.path.join(desktop_dir, 'flagged_traffic.txt')
+
+# Define suspicious patterns including telemetry traffic, C2, reverse shells, and backdoors
+SUSPICIOUS_PATTERNS = {
+    'suspicious_ports': [23, 2323, 3389, 1433, 22],  # Suspicious ports (Telnet, RDP, etc.)
+    'known_bad_ips': ['123.456.789.000', '111.222.333.444'],  # Known malicious IPs
+    'malicious_patterns': [
+        r'\x00\x00\x00\x00',          # Example attack pattern
+        r'[^ ]*sh -i',                # Simple reverse shell pattern
+        r'nc -e /bin/bash',            # Netcat reverse shell pattern
+        r'cmd.exe /c "powershell.exe'  # Windows reverse shell pattern
+    ],
+    'c2_traffic': [
+        r'User-Agent: Cobalt Strike',  # Example C2 pattern (Cobalt Strike)
+        r'User-Agent: Metasploit',     # Metasploit C2 traffic
+        r'\x50\x4f\x4e\x47'            # Generic ping C2 check
+    ],
+    'telemetry_servers': [
+        'telemetry.microsoft.com',
+        'stats.g.doubleclick.net',     # Google Analytics
+        's3.amazonaws.com',            # Amazon Web Services (Common for cloud services)
+        'api.segment.io',              # Segment (widely used telemetry service)
+        'analytics.adobe.com'          # Adobe telemetry
+    ]
+}
+
+# Reverse DNS lookup
+def reverse_dns_lookup(ip):
+    try:
+        return socket.gethostbyaddr(ip)[0]
+    except socket.herror:
+        return None
+
+# IP WHOIS lookup
+def ip_whois_lookup(ip):
+    try:
+        response = requests.get(f"http://ip-api.com/json/{ip}")
+        if response.status_code == 200:
+            data = response.json()
+            return f"{data['org']} ({data['country']}, {data['regionName']})"
+        return "Unknown Source"
+    except requests.RequestException:
+        return "WHOIS lookup failed"
+
+# Stop signal handler
+def signal_handler(sig, frame):
+    global capture_running
+    capture_running = False
+    print("\nStopping traffic capture...")
+
+# Analyze the packet and categorize it
+def analyze_packet(packet, ui_windows):
+    flagged = False
+    flagged_type = None
+    log_message = None
+    
+    if hasattr(packet, 'ip'):
+        src_ip = packet.ip.src
+        dst_ip = packet.ip.dst
+        try:
+            dst_port = int(packet[packet.transport_layer].dstport)
+        except Exception:
+            dst_port = None
+
+        if dst_ip in SUSPICIOUS_PATTERNS['known_bad_ips'] or src_ip in SUSPICIOUS_PATTERNS['known_bad_ips']:
+            flagged_type = 'C2 Suspicion'
+            log_message = f"Suspicious IP Detected: {src_ip} -> {dst_ip}"
+            flagged = True
+
+        if dst_port and dst_port in SUSPICIOUS_PATTERNS['suspicious_ports']:
+            flagged_type = 'Suspicious Ports'
+            log_message = f"Suspicious Port Detected: {src_ip} -> {dst_ip} (Port {dst_port})"
+            flagged = True
+
+    if any(re.search(pattern, str(packet)) for pattern in SUSPICIOUS_PATTERNS['malicious_patterns']):
+        flagged_type = 'Malware Suspicion'
+        log_message = f"Possible Reverse Shell or Malware Detected: {packet}"
+        flagged = True
+
+    if any(re.search(pattern, str(packet)) for pattern in SUSPICIOUS_PATTERNS['c2_traffic']):
+        flagged_type = 'C2 Suspicion'
+        log_message = f"Possible C2 Traffic Detected: {packet}"
+        flagged = True
+
+    if hasattr(packet, 'dns'):
+        dns_query = packet.dns.qry_name
+        if dns_query in SUSPICIOUS_PATTERNS['telemetry_servers']:
+            flagged_type = 'Telemetry Found'
+            log_message = f"Telemetry Traffic Detected: DNS Query for {dns_query}"
+            flagged = True
+
+    if flagged and flagged_type:
+        log_flagged_traffic(log_message, flagged_type)
+        update_ui(ui_windows[flagged_type], log_message)
+
+# Log flagged traffic to file
+def log_flagged_traffic(message, category):
+    with open(flagged_traffic_file, 'a') as f:
+        f.write(f"{datetime.now()} - [{category}] {message}\n")
+
+# Update UI window with flagged message
+def update_ui(win, message):
+    win.addstr(f"{message}\n")
+    win.refresh()
+
+# Run packet capture
+def run_capture(interface, ui_windows):
+    print(f"Starting capture on {interface}...")
+    capture = pyshark.LiveCapture(interface=interface)
+    global capture_running
+    for packet in capture.sniff_continuously():
+        if not capture_running:
+            break
+        analyze_packet(packet, ui_windows)
+
+# Setup UI with curses for different traffic types
+def start_ui():
+    stdscr = curses.initscr()
+    curses.start_color()
+    stdscr.clear()
+
+    # Define UI windows for different categories
+    win_c2 = curses.newwin(10, 80, 0, 0)
+    win_tel = curses.newwin(10, 80, 11, 0)
+    win_malware = curses.newwin(10, 80, 22, 0)
+    win_ssh = curses.newwin(10, 80, 33, 0)
+    win_telnet = curses.newwin(10, 80, 44, 0)
+
+    win_c2.box()
+    win_tel.box()
+    win_malware.box()
+    win_ssh.box()
+    win_telnet.box()
+
+    win_c2.addstr(0, 1, "C2 Suspicion")
+    win_tel.addstr(0, 1, "Telemetry Found")
+    win_malware.addstr(0, 1, "Malware Suspicion")
+    win_ssh.addstr(0, 1, "SSH Suspicion")
+    win_telnet.addstr(0, 1, "Telnet Suspicion")
+
+    win_c2.refresh()
+    win_tel.refresh()
+    win_malware.refresh()
+    win_ssh.refresh()
+    win_telnet.refresh()
+
+    return {
+        'C2 Suspicion': win_c2,
+        'Telemetry Found': win_tel,
+        'Malware Suspicion': win_malware,
+        'SSH Suspicion': win_ssh,
+        'Telnet Suspicion': win_telnet
+    }
+
+def stop_ui():
+    curses.endwin()
+
+if __name__ == '__main__':
+    try:
+        # Start UI and signal handler
+        signal.signal(signal.SIGINT, signal_handler)
+        ui_windows = start_ui()
+
+        # Ensure the log file exists on the desktop
+        with open(flagged_traffic_file, 'w') as f:
+            f.write("Flagged Traffic Log\n")
+
+        # Start capture on the default network interface
+        run_capture('eth0', ui_windows)
+    finally:
+        stop_ui()
+        print(f"\nTraffic scan stopped. Flagged items saved to {flagged_traffic_file}.")
+EOF
+
+# Install Python dependencies
+echo "Installing Python dependencies..."
+sudo pip3 install pyshark requests dnspython
+
+# Make the Python script executable
+echo "Making the Python script executable..."
+sudo chmod +x $INSTALL_DIR/$SCRIPT_NAME
+
+# Create a symlink for start command
+echo "Creating symlink for 'start-zguardian'..."
+{
+    echo '#!/bin/bash'
+    echo "sudo python3 $INSTALL_DIR/$SCRIPT_NAME"
+} | sudo tee $START_SYMLINK > /dev/null
+sudo chmod +x $START_SYMLINK
+
+# Create a symlink for stop command
+echo "Creating symlink for 'stop-zguardian'..."
+{
+    echo '#!/bin/bash'
+    echo "sudo pkill -f $SCRIPT_NAME"
+} | sudo tee $STOP_SYMLINK > /dev/null
+sudo chmod +x $STOP_SYMLINK
+
+# Success message
+echo "Installation complete!"
+echo "Use 'start-zguardian' to run the tool and 'stop-zguardian' to stop it."
